@@ -106,6 +106,32 @@ def main():
                 nx, nz = -nx, -nz
             hits.append((x, z, nx, nz, i == 0))
     print("岩場の点", len(hits))
+    # 道路（車道・歩道・路地）にかからないように：岩は、点から海の側へ o0〜o0+6.5m・岸にそって ±1.75m の所に置き、
+    # 大きいものは半径 2.7m ほどある。その範囲が道路から 2m 以上はなれる o0（−1.5m から 0.5m ずつ海の側へ）を点ごとに決める。
+    # 6m ずらしてもだめな点（道路が海ぎわを通る所）には岩を置かない
+    from make_seawall import RoadMask
+    RM = RoadMask(T)
+    kept = []
+    for (x, z, nx, nz, first) in hits:
+        o0 = -1.5
+        while o0 <= 6.0:
+            bad = False
+            o = o0 - 4.7
+            while o <= o0 + 6.5 + 4.7 and not bad:
+                t = -6.5
+                while t <= 6.5:
+                    if RM.road(x + nx * o - nz * t, z + nz * o + nx * t):
+                        bad = True
+                        break
+                    t += 0.5
+                o += 0.5
+            if not bad:
+                break
+            o0 += 0.5
+        if o0 <= 6.0:
+            kept.append((x, z, nx, nz, first, o0))
+    print("道路にかからない点", len(kept), "（はなした点", sum(1 for k in kept if k[5] > -1.5), "）")
+    hits = kept
     # 続く点を列に（4.5m より離れたら切る）、120m ごとに分ける
     runs, cur = [], []
     for h in hits:
@@ -118,7 +144,7 @@ def main():
     runs = [r for r in runs if len(r) >= 3]
     S["facades"] = [f for f in S["facades"] if f.get("model") != "rocks"]
     for n, r in enumerate(runs):
-        pts = [[round(p[0], 2), round(p[1], 2), round(p[2], 3), round(p[3], 3)] for p in r]
+        pts = [[round(p[0], 2), round(p[1], 2), round(p[2], 3), round(p[3], 3), p[5]] for p in r]
         mx, mz = pts[len(pts) // 2][0], pts[len(pts) // 2][1]
         S["facades"].append({"name": "岩場 %d" % n, "poly": [[mx, mz], [mx + 0.3, mz], [mx + 0.3, mz + 0.3], [mx, mz + 0.3]], "model": "rocks", "pts": pts})
     io.open(SP, "w", encoding="utf-8").write(json.dumps(S, ensure_ascii=False, indent=1) + "\n")

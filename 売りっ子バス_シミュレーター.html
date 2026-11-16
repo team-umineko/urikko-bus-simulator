@@ -3967,6 +3967,12 @@ const Town = {
     }
     return null;
   },
+  // 車道の中か（その場所のタイルを組み立て済みのときだけ。まだなら false）
+  carAtW(x, z) {
+    const ts = this.tile; if (!ts) return false;
+    const g = this.geo.get(Math.floor(x / ts) + "," + Math.floor(z / ts));
+    return !!(g && g.carAt && g.carAt(x, z));
+  },
   hAt(x, z) {
     const ts = this.tile; if (!ts) return null;
     const i = Math.floor(x / ts), j = Math.floor(z / ts);
@@ -4973,19 +4979,46 @@ const Town = {
       const CW = (TRt && TRt.cw) || [];
       if (t.mk || t.mkd || CW.length) {
         const mpos = [], midx = [];
+        // 黄色の中央線（交通データ）の線分を 2m の升に登録。白い線（地図の区画線）のうち、黄色の線から 0.25m 以内で同じ向きの所は描かない
+        // （同じ中央線が両方のデータにあり、5cm ほどずれて重なるので、黄色の線のふちに白い線がはみ出して見えていた）
+        const ygrid = new Map(), ykey = (cx, cz) => (cx + 8) * 1024 + (cz + 8);
+        for (const l of (TRt && TRt.yl) || []) {
+          let P = []; for (let i = 0; i + 1 < l.length; i += 2) P.push([l[i] - ox, l[i + 1] - oz]);
+          if (P.length > 2) P = smoothLine(P);
+          for (let i = 0; i + 1 < P.length; i++) {
+            const a = P[i], b = P[i + 1], seg = [a, b];
+            for (let cx = Math.floor((Math.min(a[0], b[0]) - 0.3) / 2); cx <= Math.floor((Math.max(a[0], b[0]) + 0.3) / 2); cx++)
+              for (let cz = Math.floor((Math.min(a[1], b[1]) - 0.3) / 2); cz <= Math.floor((Math.max(a[1], b[1]) + 0.3) / 2); cz++) {
+                const k = ykey(cx, cz); if (!ygrid.has(k)) ygrid.set(k, []); ygrid.get(k).push(seg);
+              }
+          }
+        }
+        const nearYellow = (x, z, ux, uz) => {
+          const l = ygrid.get(ykey(Math.floor(x / 2), Math.floor(z / 2))); if (!l) return false;
+          for (const [a, b] of l) {
+            const ex = b[0] - a[0], ez = b[1] - a[1], L2 = ex * ex + ez * ez; if (L2 < 1e-6) continue;
+            const u = Math.max(0, Math.min(1, ((x - a[0]) * ex + (z - a[1]) * ez) / L2));
+            if (Math.hypot(x - a[0] - ex * u, z - a[1] - ez * u) < 0.25 && Math.abs(ux * ex + uz * ez) / Math.sqrt(L2) > 0.85) return true;
+          }
+          return false;
+        };
         const ribbon = (P, w, H) => {
           const n = P.length; if (n < 2) return;
           const nv = P.map((p, i) => { const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)]; let dx = b[0] - a[0], dz = b[1] - a[1]; const L = Math.hypot(dx, dz) || 1; return [dz / L, -dx / L]; });
           for (let i = 0; i < n - 1; i++) {
             const p = P[i], q = P[i + 1], np_ = nv[i], nq = nv[i + 1], h = w / 2;
             if (!H && XB.length && inBand((p[0] + q[0]) / 2, (p[1] + q[1]) / 2)) continue;   // 横断歩道の所は線を切る
+            if (!H && ygrid.size) { const sx = q[0] - p[0], sz = q[1] - p[1], sl = Math.hypot(sx, sz) || 1; if (nearYellow((p[0] + q[0]) / 2, (p[1] + q[1]) / 2, sx / sl, sz / sl)) continue; }
             const A = [p[0] + np_[0] * h, p[1] + np_[1] * h], B = [p[0] - np_[0] * h, p[1] - np_[1] * h], C = [q[0] - nq[0] * h, q[1] - nq[1] * h], D = [q[0] + nq[0] * h, q[1] + nq[1] * h];
             if (H) {
               // 橋の上：床の面の高さ＋3cm（床の三角形の外なら、ならした道路の高さ）。上向きの面だけを張る
               const k = mpos.length / 3;
               for (const P_ of [A, B, C, D]) { const y = deckY(P_[0], P_[1]); mpos.push(ox + P_[0], (y != null ? y : (P_ === A || P_ === B ? H[i] + 0.06 : H[i + 1] + 0.06)) + 0.03, oz + P_[1]); }
-              const cr = (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0]);
-              if (cr > 0) midx.push(k, k + 2, k + 1, k, k + 3, k + 2); else midx.push(k, k + 1, k + 2, k, k + 2, k + 3);
+              const Q4 = [A, B, C, D];
+              for (const [i0, i1, i2] of [[0, 1, 2], [0, 2, 3]]) {
+                const a = Q4[i0], b = Q4[i1], c = Q4[i2], cr = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                if (cr > 0) midx.push(k + i0, k + i2, k + i1); else midx.push(k + i0, k + i1, k + i2);
+              }
             } else {
               for (const tri of [[A, B, C], [A, C, D]]) {
                 const cr = (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1]) - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0]);
@@ -5034,9 +5067,10 @@ const Town = {
         if (midx.length) { const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(mpos, 3)); g.setIndex(midx); g.computeVertexNormals(); g.computeBoundingSphere(); out.marks = g; }
       }
       // 路面の印の高さ（町の座標）：橋の床の上（床が地面から 4.5m 以内＝川や水路の橋）は床の面、ほかは道路の面（橋のつなぎ目の坂も）
+      const carBox = PCar.map((rings) => { let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity; for (const p of rings[0]) { x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); z0 = Math.min(z0, p[1]); z1 = Math.max(z1, p[1]); } return [x0, x1, z0, z1]; });
       out.carAt = (wx, wz) => {
         const x = wx - ox, z = wz - oz; let ins = false;
-        for (const rings of PCar) for (const r of rings) for (let i = 0, j = r.length - 1; i < r.length; j = i++) { const a = r[i], b = r[j]; if ((a[1] > z) !== (b[1] > z) && x < (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]) + a[0]) ins = !ins; }
+        for (let pi = 0; pi < PCar.length; pi++) { const bb = carBox[pi]; if (x < bb[0] || x > bb[1] || z < bb[2] || z > bb[3]) continue; for (const r of PCar[pi]) for (let i = 0, j = r.length - 1; i < r.length; j = i++) { const a = r[i], b = r[j]; if ((a[1] > z) !== (b[1] > z) && x < (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]) + a[0]) ins = !ins; } }
         return ins;
       };
       out.surfY = (wx, wz, lift) => {
@@ -6846,26 +6880,27 @@ MODELS.uohiroba = () => {
   k.pave("#8f908c", [[-16, -34], [0, -34], [0, 0.4], [-16, 0.4]]);
   for (const [x, z, w, d] of [[-9, -16, 5, 3], [-6, -24, 4, 2.5], [-11, -8, 3.5, 2.2]]) k.pave("#73756f", [[x, z], [x + w, z + 0.4], [x + w - 0.5, z + d], [x - 0.3, z + d - 0.2]], 0.02);
   // ---- 駐車場（正面の前）：写真 0〜6・16〜19 ----
-  k.pave(asph, [[-30, 0.4], [35.4, 0.4], [35.4, 60], [-30, 60]]);
+  // まわりの道路（地図の車道）の内側に収める：南東の道路 x −25〜−20、正面の道路 z 52〜61、北西の道路 x 34.5〜
+  k.pave(asph, [[-20, 0.4], [34.2, 0.4], [34.2, 52], [-20, 52]]);
   // ふちの植えこみ（芝と丸く刈った木）・道路ぞいの島（枯れた芝と、たまご形に刈った木、「歩行者多し 徐行」の旗）
-  k.pave("#8a9a5a", [[-30, 57], [35.4, 57], [35.4, 60], [-30, 60]], 0.06); k.box(kcol("#b9b6ae"), -30, 35.4, 0, 0.15, 56.85, 57.0);
-  for (let x = -27; x < 34; x += 5.5) k.bush(x, 58.5, 0.75 + ((x * 7) % 3) * 0.12, x % 2 ? "#3f6a35" : "#4c7a3c");
+  k.pave("#8a9a5a", [[-20, 48.8], [34.2, 48.8], [34.2, 51.8], [-20, 51.8]], 0.06); k.box(kcol("#b9b6ae"), -20, 34.2, 0, 0.15, 48.65, 48.8);
+  for (let x = -17.5; x < 33; x += 5.5) k.bush(x, 50.3, 0.75 + ((Math.round(x) * 7) % 3) * 0.12, Math.round(x) % 2 ? "#3f6a35" : "#4c7a3c");
   const island = (x0, x1, z0, z1, trees) => {
     const g = k.gy((x0 + x1) / 2, (z0 + z1) / 2), cb = kcol("#bdbab3");
     k.box(cb, x0, x1, g - 0.1, g + 0.16, z0, z1, "xXzZ"); k.box(kcol("#a4995f"), x0 + 0.12, x1 - 0.12, g + 0.13, g + 0.15, z0 + 0.12, z1 - 0.12, "Y");
     for (const [x, z, h] of trees) { const gg = k.gy(x, z) + 0.15; k.cyl(kcol("#6b5440"), x, z, 0.06, gg, gg + 0.3, 6, false); k.blob(kcol("#3d6a33"), x, gg + h * 0.55, z, h * 0.3, h * 0.5, h * 0.3); }
   };
   const flag = (x, z) => k.at(x, z, 0, () => { k.cyl(kcol("#c4c8cc"), 0, 0, 0.025, 0, 2.7, 6, false); k.sign((g, w, h) => { g.fillStyle = "#f6d21b"; g.fillRect(0, 0, w, h * 0.5); g.fillStyle = "#d8262e"; g.fillRect(0, h * 0.5, w, h * 0.5); g.fillStyle = "#1a1a1a"; g.textAlign = "center"; g.textBaseline = "middle"; g.font = `800 ${w * 0.6}px ${FONT}`; for (const [c, i] of [["歩", 0], ["行", 1], ["者", 2], ["多", 3], ["し", 4]]) g.fillText(c, w / 2, h * (0.05 + i * 0.09)); g.fillStyle = "#fff"; g.font = `900 ${w * 0.8}px ${FONT}`; g.fillText("徐", w / 2, h * 0.65); g.fillText("行", w / 2, h * 0.85); }, 0.03, 0.5, 0.6, 2.6, 0, { two: true, pxm: 90 }); });
-  island(33.6, 35.4, 9.5, 55.5, [[34.5, 12, 2.2], [34.5, 14.2, 2.0], [34.5, 22, 2.3], [34.5, 30, 2.1], [34.5, 38, 2.4], [34.5, 46, 2.2], [34.5, 53, 2.0]]);
-  island(-31.2, -29.4, 5.5, 55.5, [[-30.3, 8, 2.0], [-30.3, 15, 2.3], [-30.3, 23, 2.1], [-30.3, 31, 2.2], [-30.3, 40, 2.0], [-30.3, 48, 2.3]]);
-  flag(34.5, 16.0); flag(34.5, 51.0); flag(-30.3, 11.0);
+  island(32.4, 34.0, 9.5, 48.3, [[33.2, 12, 2.2], [33.2, 14.2, 2.0], [33.2, 22, 2.3], [33.2, 30, 2.1], [33.2, 38, 2.4], [33.2, 45.5, 2.2]]);
+  island(-20.0, -18.4, 5.5, 48.3, [[-19.2, 8, 2.0], [-19.2, 15, 2.3], [-19.2, 23, 2.1], [-19.2, 31, 2.2], [-19.2, 39, 2.0], [-19.2, 45.5, 2.3]]);
+  flag(33.2, 16.0); flag(33.2, 43.0); flag(-19.2, 11.0);
   // 「バス P」の案内（青い P と赤い矢印）
-  k.at(-29.6, 6.0, 0, () => { k.cyl(steel, 0, 0, 0.04, 0.15, 1.6, 6, false); k.sign((g, w, h) => { g.fillStyle = "#ffffff"; g.fillRect(0, 0, w, h); g.fillStyle = "#1a1a1a"; g.font = `900 ${h * 0.42}px ${FONT}`; g.textBaseline = "middle"; g.fillText("バス", w * 0.04, h * 0.32); g.fillStyle = "#d8262e"; g.beginPath(); g.moveTo(w * 0.18, h * 0.62); g.lineTo(w * 0.32, h * 0.62); g.lineTo(w * 0.25, h * 0.92); g.fill(); g.fillStyle = "#1f56b0"; g.fillRect(w * 0.52, h * 0.05, w * 0.45, h * 0.9); g.fillStyle = "#ffffff"; g.font = `900 ${h * 0.8}px Arial`; g.textAlign = "center"; g.fillText("P", w * 0.745, h * 0.55); }, -0.5, 0.5, 1.15, 1.6, 0.05, { two: true, pxm: 160 }); });
-  for (const [x, z] of [[-12, 30], [8, 40], [-24, 48]]) { k.line([[x, z], [x + 3.2, z]], 0.18); k.line([[x + 3.2, z], [x + 2.4, z - 0.6]], 0.18); k.line([[x + 3.2, z], [x + 2.4, z + 0.6]], 0.18); }
-  for (const x of [-15, 10, 30]) k.at(x, 28, 0, () => { k.cyl(kcol("#c4c8cc"), 0, 0, 0.09, 0, 8, 8, false); k.box(kcol("#e9ebec"), -0.3, 0.3, 7.9, 8.05, -0.6, 0.6); });
+  k.at(-19.2, 3.6, 0, () => { k.cyl(steel, 0, 0, 0.04, 0.15, 1.6, 6, false); k.sign((g, w, h) => { g.fillStyle = "#ffffff"; g.fillRect(0, 0, w, h); g.fillStyle = "#1a1a1a"; g.font = `900 ${h * 0.42}px ${FONT}`; g.textBaseline = "middle"; g.fillText("バス", w * 0.04, h * 0.32); g.fillStyle = "#d8262e"; g.beginPath(); g.moveTo(w * 0.18, h * 0.62); g.lineTo(w * 0.32, h * 0.62); g.lineTo(w * 0.25, h * 0.92); g.fill(); g.fillStyle = "#1f56b0"; g.fillRect(w * 0.52, h * 0.05, w * 0.45, h * 0.9); g.fillStyle = "#ffffff"; g.font = `900 ${h * 0.8}px Arial`; g.textAlign = "center"; g.fillText("P", w * 0.745, h * 0.55); }, -0.5, 0.5, 1.15, 1.6, 0.05, { two: true, pxm: 160 }); });
+  for (const [x, z] of [[-10, 32.5], [10, 32.5], [-14, 47.4]]) { k.line([[x, z], [x + 3.2, z]], 0.18); k.line([[x + 3.2, z], [x + 2.4, z - 0.6]], 0.18); k.line([[x + 3.2, z], [x + 2.4, z + 0.6]], 0.18); }
+  for (const x of [-15, 10, 28]) k.at(x, 24, 0, () => { k.cyl(kcol("#c4c8cc"), 0, 0, 0.09, 0, 8, 8, false); k.box(kcol("#e9ebec"), -0.3, 0.3, 7.9, 8.05, -0.6, 0.6); });
   // 駐車ます：入口の前（車いす用の広います）と、背中合わせの 2 列が 2 つ
   k.stalls(-10, 9, 0, 5, { side: -1, occ: 0.6, seed: 2, w: 3.2 });
-  k.stalls(-27, 26, 0, 20, { double: true, occ: 0.6, seed: 21 }); k.stalls(-27, 44, 0, 20, { double: true, occ: 0.5, seed: 22 });
+  k.stalls(-17.4, 24, 0, 19, { double: true, occ: 0.6, seed: 21 }); k.stalls(-17.4, 41, 0, 19, { double: true, occ: 0.5, seed: 22 });
   return k.done();
 };
 
@@ -8222,14 +8257,29 @@ MODELS.kowa = (sp, f) => {
   k.box(pt, XH, X0, 0, PY, -38.5, -12.0, "xYzZ"); k.box(kcol("#f6f6f2"), XH, X0, 4.6, 4.8, -38.5, -12.0, "yY");
   for (const x of [XH + 3, XH + 9]) for (const z of [-36.5, -27.5, -18.5]) k.box(white, x - 0.12, x + 0.12, PY, 4.6, z - 0.12, z + 0.12);
   for (const z of [-15.5, -28.5, -37.6]) { k.box(kcol("#f2c21a"), XH - 2.0, XH - 1.6, 0.2, 1.2, z - 0.9, z + 0.9); k.box(kcol("#2b2d30"), XH - 2.0, XH - 1.6, 0.9, 1.0, z - 0.95, z + 0.95, "X"); }
-  // ---- 駅前（西のロータリーの側）：自転車置き場（紫がかった屋根）とバスの待合の屋根 ----
-  // （以前は Z 13.5〜19 にもう 1 列あったが、ロータリーの車道の上にはみ出していたので消した）
-  for (const [z0, z1] of [[1.0, 6.5]]) {
-    const pr = []; for (let i = 0; i <= 8; i++) { const a = Math.PI * i / 8; pr.push([(z0 + z1) / 2 - Math.cos(a) * (z1 - z0) / 2, 2.4 + Math.sin(a) * 0.5]); }
-    for (let i = 0; i < 8; i++) k.quad(kcol("#6c5a86", { two: true }), [-58, pr[i][1], pr[i][0]], [-8, pr[i][1], pr[i][0]], [-8, pr[i + 1][1], pr[i + 1][0]], [-58, pr[i + 1][1], pr[i + 1][0]]);
-    for (let x = -57; x <= -8.5; x += 4) for (const z of [z0 + 0.2, z1 - 0.2]) k.box(grey, x - 0.04, x + 0.04, 0, 2.45, z - 0.04, z + 0.04);
-    for (let i = 0; i < 70; i++) if ((i * 37) % 10 < 7) kBike(k, -57 + i * 0.7, (z0 + z1) / 2 + ((i % 2) ? 1.2 : -1.2), (i % 2) ? 90 : -90, i, i % 9 === 0);
-  }
+  // ---- 駅前（西のロータリーの側）：自転車置き場（紫がかった丸い屋根）とバスの待合の屋根 ----
+  // 自転車置き場は、基盤地図情報の屋根（無壁舎）の形のとおり L 字：ロータリーの北のふち（ホームの側）と西のふちにそって置く。
+  // （以前は Z 1〜6.5 のロータリーの中に置いていて、バスのとまる所・通る所にかかっていた）
+  //   北の腕：X −60.5〜−8.9（地図では −5.1 までだが、その先は駅ビルの入口の中になるので、駅ビルの西の壁 X −8.6 の手前で止める）、Z −5.9〜−2.2。
+  //   西の腕：X −60.6〜−56.8、Z −2.2〜21.3。床（明るい灰色）は landmarks.json の pave
+  const roofC = kcol("#6c5a86", { two: true });
+  // arm(a0, a1, b0, b1, alongX)：長い向き a0〜a1、幅 b0〜b1。alongX なら長い向きが X（北の腕）、そうでなければ Z（西の腕）
+  const arm = (a0, a1, b0, b1, alongX, seed) => {
+    const P = (a, b, y) => (alongX ? [a, y, b] : [b, y, a]);
+    const pr = []; for (let i = 0; i <= 8; i++) { const t = Math.PI * i / 8; pr.push([(b0 + b1) / 2 - Math.cos(t) * (b1 - b0) / 2, 2.35 + Math.sin(t) * 0.45]); }
+    for (let i = 0; i < 8; i++) k.quad(roofC, P(a0, pr[i][0], pr[i][1]), P(a1, pr[i][0], pr[i][1]), P(a1, pr[i + 1][0], pr[i + 1][1]), P(a0, pr[i + 1][0], pr[i + 1][1]));
+    // 柱（4m ごと、両がわ）と、屋根のふちのはり
+    for (let a = a0 + 0.4; a <= a1 - 0.3; a += 4) for (const b of [b0 + 0.2, b1 - 0.2]) { const q = P(a, b, 0); k.box(grey, q[0] - 0.04, q[0] + 0.04, 0, 2.4, q[2] - 0.04, q[2] + 0.04); }
+    for (const b of [b0 + 0.2, b1 - 0.2]) { const p = P(a0, b, 0), q = P(a1, b, 0); k.box(grey, Math.min(p[0], q[0]) - 0.04, Math.max(p[0], q[0]) + 0.04, 2.33, 2.4, Math.min(p[2], q[2]) - 0.04, Math.max(p[2], q[2]) + 0.04); }
+    // 自転車：幅のまん中をはさんで向かい合う 2 列（0.7m ごと、7 割ほど）。ところどころ原付
+    const bc = (b0 + b1) / 2, n = Math.floor((a1 - a0 - 0.8) / 0.7);
+    for (let i = 0; i < n; i++) if (((i + seed) * 37) % 10 < 7) {
+      const a = a0 + 0.6 + i * 0.7, s = i % 2 ? 1 : -1, b = bc + s * 0.85, p = P(a, b, 0);
+      kBike(k, p[0], p[2], alongX ? (s > 0 ? 90 : -90) : (s > 0 ? 180 : 0), i + seed, (i + seed) % 9 === 0);
+    }
+  };
+  arm(-60.5, -8.9, -5.9, -2.2, true, 0);
+  arm(-2.2, 21.3, -60.6, -56.8, false, 5);
   k.box(kcol("#e9ebec"), -4.4, 4.4, 3.0, 3.15, 0.5, 3.9); for (const x of [-4.2, 4.2]) k.box(grey, x - 0.05, x + 0.05, 0, 3.0, 0.7, 0.8); k.box(kcol("#cfe0e6", { op: 0.4, two: true }), -4.2, 4.2, 0.3, 2.6, 0.7, 0.72, "Z");
   for (let i = 0; i < 3; i++) k.box(kcol("#8a6a4b"), -3.8 + i * 2.6, -2.0 + i * 2.6, 0.42, 0.48, 1.0, 1.4);
   return k.done();
@@ -8586,19 +8636,20 @@ MODELS.seawall = (sp, f) => {
   return k.done();
 };
 // ---- 岩場（tools/make_rocks.py：経路から見える自然の海岸線の波打ちぎわ）----
-// 角ばった岩（灰色〜こげ茶。海の側の低い所は、のりで黒っぽい緑）を、海岸線の 4m ごとに 2〜3 個。f.pts：[x, z, 海の向き nx, nz]
+// 角ばった岩（灰色〜こげ茶。海の側の低い所は、のりで黒っぽい緑）を、海岸線の 4m ごとに 2〜3 個。f.pts：[x, z, 海の向き nx, nz, 置く範囲の始まり o0]
 MODELS.rocks = (sp, f) => {
   const P = f.pts, k = kitW(P[0][0], P[0][1]);
   const ico = (Kit.ico0 || (Kit.ico0 = new THREE.IcosahedronGeometry(1, 0))).attributes.position;
   const cols = ["#9a948a", "#8a8378", "#a39c90", "#7f786e", "#b0a99c"].map((c) => kcol(c, { uw: true })), weed = kcol("#66705a", { uw: true });
   let s = Math.abs(Math.round(P[0][0] * 7 + P[0][1] * 13)) % 9973 + 1; const rnd = () => { s = (s * 16807) % 2147483647; return s / 2147483647; };
-  for (const [x, z, nx, nz] of P) {
+  for (const [x, z, nx, nz, o0 = -1.5] of P) {        // o0：岩を置く範囲の始まり（道路から 2m 以上はなれるように、tools/make_rocks.py が決めたもの）
     const n = 2 + (rnd() < 0.4 ? 1 : 0);
     for (let j = 0; j < n; j++) {
-      const o = -1.5 + rnd() * 6.5, t = (rnd() - 0.5) * 3.5, wx = x + nx * o - nz * t, wz = z + nz * o + nx * t;
+      const o = o0 + rnd() * 6.5, t = (rnd() - 0.5) * 3.5, wx = x + nx * o - nz * t, wz = z + nz * o + nx * t;
       const g = Math.max(Town.hAt(wx, wz) ?? -0.6, -0.6), r = 0.6 + rnd() * 1.3, low = g < -0.2;
       const sx = r * (0.8 + rnd() * 0.6), sy = r * (0.6 + rnd() * 0.4), sz = r * (0.8 + rnd() * 0.6), a = rnd() * 6.28, ca = Math.cos(a), sa = Math.sin(a);
       const m = low && rnd() < 0.6 ? weed : cols[Math.floor(rnd() * cols.length)], cx = wx - k.ax, cy = g + sy * 0.55 - k.y0, cz = wz - k.az;
+      if (Town.treeBlocked(wx, wz) || Town.carAtW(wx, wz)) continue;     // 施設の敷地（港の駐車場・岸壁の前など）と車道には置かない
       const V = (i) => { const ox = ico.getX(i), oy = ico.getY(i), oz = ico.getZ(i), jt = 0.82 + 0.36 * (Math.abs(Math.sin(ox * 12.99 + oy * 78.23 + oz * 37.72 + a) * 43758.55) % 1), px = ox * sx * jt, py = oy * sy * jt, pz = oz * sz * jt; return [cx + px * ca - pz * sa, cy + py, cz + px * sa + pz * ca]; };
       for (let i = 0; i < ico.count; i += 3) k.tri(m, V(i), V(i + 1), V(i + 2));
     }
@@ -8656,19 +8707,21 @@ MODELS.ebisen = (sp) => {
   // 北の長い塀：白地に、青・黄・だいだい・緑の三角もよう
   k.panel((g, w, h) => { g.fillStyle = "#f4f3ee"; g.fillRect(0, 0, w, h); const cs = ["#2f7fc4", "#f2c21a", "#f08a2c", "#3aa76d", "#2aa7a0", "#e6583c"]; for (let i = 0; i < 26; i++) { g.fillStyle = cs[i % 6]; const x = i * w / 26, up = i % 2; g.beginPath(); g.moveTo(x, up ? 0 : h); g.lineTo(x + w / 13, up ? 0 : h); g.lineTo(x + w / 26, up ? h : 0); g.fill(); } }, [-28, 0, -0.6], [-1.2, 0, -0.6], [-1.2, 2.2, -0.6], [-28, 2.2, -0.6], 26.8, 2.2, { pxm: 40, two: true });
   // 道路ぎわの看板（丸いロゴ・白い板に「えびせんパーク」）とソテツ・石
-  k.at(-3, 24, 0, () => {
+  // 道路ぎわの看板：車道（x −894〜−883）と歩道（〜−879）の外、駐車場のはし
+  k.at(-3, 18.5, 0, () => {
     for (const x of [-1.1, 1.1]) k.box(kcol("#b9bcbf"), x - 0.08, x + 0.08, 0, 5.2, -0.08, 0.08);
     k.sign((g, w, h) => drawEbisen(g, w / 2, h * 0.46, h * 0.3), -1.7, 1.7, 5.2, 8.4, 0, { alpha: true, two: true });
     k.sign(drawText("えびせんパーク", { color: "#4a342a", bg: "#fbfbf8", font: BRUSH, weight: 900, fill: 0.62 }), -2.1, 2.1, 4.1, 5.2, 0.02, { two: true });
     k.blob(kcol("#a39a8a"), 2.6, 0.5, 1.2, 2.2, 0.9, 1.6);
   });
-  k.palm(-5.2, 25, 1.4, 2.0);
+  k.palm(-5.8, 19.2, 1.4, 2.0);
   // 駐車場（写真 0〜15）：建物の西から道路ぎわまでの広い駐車場。白い「車」の字・コンクリートの側溝（鉄のふた）・赤いコーン・
   //   南の端に白い柵と、ピンクの小さな売店（キッチンカーの小屋）。道路ぎわは竹やぶ
   k.pave(asph, [[-9, 0.6], [L + 32, 0.6], [L + 32, 50], [-9, 18]]);
   k.stalls(-6, 12, 0, 36, { side: -1, occ: 0.35, seed: 51 }); k.stalls(-6, 17, 0, 36, { double: true, occ: 0.25, seed: 52 });
   k.stalls(57, 31, 0, 11, { double: true, occ: 0.3, seed: 53 });
-  for (const z of [6.2, 28.5]) { k.pave("#a9a7a0", [[-6, z - 0.45], [L + 30, z - 0.45], [L + 30, z + 0.45], [-6, z + 0.45]], 0.06); for (let x = -5; x < L + 29; x += 3.2) k.pave("#45484b", [[x, z - 0.3], [x + 1.4, z - 0.3], [x + 1.4, z + 0.3], [x, z + 0.3]], 0.07); }
+  // 側溝：駐車場の西のはしは道路にそって斜めなので、西の側溝（z 28.5）は、駐車場の中に入る所（x 25）から（南の端まで引くと車道に出ていた）
+  for (const [z, x0] of [[6.2, -6], [28.5, 25]]) { k.pave("#a9a7a0", [[x0, z - 0.45], [L + 30, z - 0.45], [L + 30, z + 0.45], [x0, z + 0.45]], 0.06); for (let x = x0 + 1; x < L + 29; x += 3.2) k.pave("#45484b", [[x, z - 0.3], [x + 1.4, z - 0.3], [x + 1.4, z + 0.3], [x, z + 0.3]], 0.07); }
   for (const [x, z] of [[2, 9], [20, 9], [38, 9], [56, 9.5], [70, 24], [79, 24], [62, 41]]) kRoadText(k, "車", x, z, 90, 1.6, 1.8);
   for (const [x, z] of [[4, 24], [9, 23.5], [30, 25], [52, 26], [86, 20], [86, 28]]) k.at(x, z, 0, () => { k.cyl(kcol("#e8452f"), 0, 0, 0.15, 0, 0.7, 8); k.box(kcol("#f4f4f1"), -0.12, 0.12, 0.38, 0.5, -0.12, 0.12); k.box(kcol("#2a2a2a"), -0.2, 0.2, 0, 0.04, -0.2, 0.2); });
   kPipe(k, [[L + 31, 1], [L + 31, 47]], 0.9, "#f4f4f1");
@@ -9269,21 +9322,37 @@ class World {
       const tc = G ? clipRect(tri, G.ox, G.oz, G.ox + ts, G.oz + ts) : tri; if (!tc.length) return;
       drapeGrid(tc, (Q) => { const k = B.p.length / 3; for (const q of Q) B.p.push(q[0], sy(q[0], q[1], lift), q[1]); for (let j = 1; j + 1 < Q.length; j++) B.i.push(k, k + j, k + j + 1); });
     };
-    const strip = (B, pts, w, lift, smooth = true) => {
+    // 横断歩道の帯（このタイルを通るもの）
+    const XBW = (TL.xb || []).map((r) => { const R = []; for (let i = 0; i + 1 < r.length; i += 2) R.push([r[i], r[i + 1]]); return R; });
+    const inXB = (x, z) => XBW.some((R) => { let c = false; for (let i = 0, j = R.length - 1; i < R.length; j = i++) { const a = R[i], b = R[j]; if ((a[1] > z) !== (b[1] > z) && x < (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]) + a[0]) c = !c; } return c; });
+    const strip = (B, pts, w, lift, smooth = true, cutXB = false) => {
       let P = []; for (let i = 0; i + 1 < pts.length; i += 2) P.push([pts[i], pts[i + 1]]);
       if (smooth && P.length > 2) P = smoothLine(P);
       const n = P.length; if (n < 2) return;
       const nv = P.map((p, i) => { const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)]; const dx = b[0] - a[0], dz = b[1] - a[1], L = Math.hypot(dx, dz) || 1; return [dz / L * w / 2, -dx / L * w / 2]; });
+      // 横断歩道の所は線を切る。切ったあとに残った、3m より短い切れはし（交差点の中など）は描かない
+      const keep = new Array(n - 1).fill(true);
+      if (cutXB && XBW.length) {
+        for (let i = 0; i + 1 < n; i++) keep[i] = !inXB((P[i][0] + P[i + 1][0]) / 2, (P[i][1] + P[i + 1][1]) / 2);
+        const cut = keep.some((v) => !v);
+        for (let i = 0; i + 1 < n && cut;) {
+          if (!keep[i]) { i++; continue; }
+          let j = i, len = 0; while (j + 1 < n && keep[j]) { len += Math.hypot(P[j + 1][0] - P[j][0], P[j + 1][1] - P[j][1]); j++; }
+          if (len < 3) for (let q = i; q < j; q++) keep[q] = false;
+          i = j;
+        }
+      }
       for (let i = 0; i + 1 < n; i++) {
         const a = P[i], b = P[i + 1]; if (Math.hypot(b[0] - a[0], b[1] - a[1]) < 0.01) continue;
+        if (!keep[i]) continue;
         const A = [a[0] + nv[i][0], a[1] + nv[i][1]], Bq = [a[0] - nv[i][0], a[1] - nv[i][1]], C = [b[0] - nv[i + 1][0], b[1] - nv[i + 1][1]], D = [b[0] + nv[i + 1][0], b[1] + nv[i + 1][1]];
         dtri(B, [A, Bq, C], lift); dtri(B, [A, C, D], lift);
       }
     };
     for (const [x1, z1, x2, z2, w] of TL.sl || []) strip(W_, [x1, z1, x2, z2], w, 0.08, false);
-    for (const l of TL.yl || []) strip(Y_, l, 0.15, 0.085);
+    for (const l of TL.yl || []) strip(Y_, l, 0.15, 0.085, true, true);
     // 上下線が分かれた道の白線（外側線・分離帯側の線・車線の境の破線）
-    for (const l of TL.wl || []) strip(W_, l, 0.15, 0.08);
+    for (const l of TL.wl || []) strip(W_, l, 0.15, 0.08, true, true);
     // 中央分離帯：中心線と幅の列 [x, z, 幅, ...]。高さ 20cm の縁石（幅 15cm）と、真ん中の植え込み
     const MT = { p: [], i: [] }, MC = { p: [], i: [] };
     const wall = (a, b, h) => {
@@ -9322,11 +9391,28 @@ class World {
     }
     // 路面の文字：C＝手前のはしの中心、t＝進む向き、幅 w・長さ L。地面の三角形ごとに切って貼り、画像の位置は場所から決める
     const carAt = (x, z) => !G || !G.carAt || G.carAt(x, z);
-    const decals = new Map();
+    const decals = new Map(), placedD = [];
+    // 停止線（このタイルを通るもの）までの距離
+    const SLW = (TL.sl || []).map(([x1, z1, x2, z2]) => [x1, z1, x2, z2]);
+    const nearStopLine = (x, z, R) => SLW.some(([x1, z1, x2, z2]) => { const ex = x2 - x1, ez = z2 - z1, L2 = ex * ex + ez * ez || 1, u = Math.max(0, Math.min(1, ((x - x1) * ex + (z - z1) * ez) / L2)); return Math.hypot(x - x1 - ex * u, z - z1 - ez * u) < R; });
+    // 文字の四角が、車道からはみ出さず、横断歩道・停止線・ほかの文字と重ならないか（四角の中の 15 点で調べる）
+    const MDW = [];
+    for (const s of T.md || []) { const n = s.length / 3; for (let i = 0; i + 1 < n; i++) MDW.push([s[3 * i], s[3 * i + 1], s[3 * i + 3], s[3 * i + 4], Math.max(s[3 * i + 2], s[3 * i + 5]) / 2]); }
+    const onMedian = (x, z) => MDW.some(([x1, z1, x2, z2, hw]) => { const ex = x2 - x1, ez = z2 - z1, L2 = ex * ex + ez * ez || 1, u = Math.max(0, Math.min(1, ((x - x1) * ex + (z - z1) * ez) / L2)); return Math.hypot(x - x1 - ex * u, z - z1 - ez * u) < hw + 0.3; });
+    const decalFree = (C, t, w, L) => {
+      const r = [-t[1], t[0]], P = (s, l) => [C[0] + r[0] * s + t[0] * l, C[1] + r[1] * s + t[1] * l];
+      for (const [s, l] of [[0, 0.2], [0, L - 0.2], [-w / 2, L / 2], [w / 2, L / 2]]) { const q = P(s, l); if (!carAt(q[0], q[1])) return false; }
+      for (const fs of [-0.5, 0, 0.5]) for (const fl of [0, 0.25, 0.5, 0.75, 1]) {
+        const q = P(fs * (w + 0.3), -0.3 + fl * (L + 0.6));
+        if (inXB(q[0], q[1]) || nearStopLine(q[0], q[1], 0.35) || (MDW.length && onMedian(q[0], q[1]))) return false;
+      }
+      const cx = C[0] + t[0] * L / 2, cz = C[1] + t[1] * L / 2, rr = Math.hypot(w, L) / 2;
+      return !placedD.some(([x, z, r2]) => Math.hypot(cx - x, cz - z) < rr + r2 + 0.3);
+    };
     const decal = (mat, C, t, w, L) => {
       const r = [-t[1], t[0]], P = (s, l) => [C[0] + r[0] * s + t[0] * l, C[1] + r[1] * s + t[1] * l];
-      // 車道からはみ出すなら描かない（曲がり角・細い道）
-      for (const [s, l] of [[0, 0.2], [0, L - 0.2], [-w / 2, L / 2], [w / 2, L / 2]]) { const q = P(s, l); if (!carAt(q[0], q[1])) return false; }
+      if (!decalFree(C, t, w, L)) return false;
+      placedD.push([C[0] + t[0] * L / 2, C[1] + t[1] * L / 2, Math.hypot(w, L) / 2]);
       if (!decals.has(mat)) decals.set(mat, { p: [], u: [], i: [] });
       const B = decals.get(mat), q0 = P(-w / 2, 0), q1 = P(w / 2, 0), q2 = P(w / 2, L), q3 = P(-w / 2, L);
       for (const tri of [[q0, q1, q2], [q0, q2, q3]]) {
@@ -9348,13 +9434,14 @@ class World {
         for (const [x1, z1, x2, z2] of TL.sl || []) { const mx = (x1 + x2) / 2, mz = (z1 + z2) / 2, dd = Math.hypot(mx - x, mz - z); if (dd < 10 && (!best || dd < best[0])) best = [dd, mx, mz, Math.hypot(x2 - x1, z2 - z1)]; }
         if (!best) continue;
         const w = Math.min(1.15, best[3] * 0.5), L = w * 5;
-        decal(X.stopText, [best[1] - t[0] * (0.8 + L), best[2] - t[1] * (0.8 + L)], t, w, L);
+        decal(X.stopText, [best[1] - t[0] * (0.8 + L), best[2] - t[1] * (0.8 + L)], t, w, L - 0.5);
       } else if (v) {
         // 最高速度の数字：標識の右（車道のはしから 1.45m＝車線のまん中）、標識の 3m 先
         let d0 = -1;
         for (let dd = 0.25; dd <= 5; dd += 0.25) if (carAt(x + r[0] * dd, z + r[1] * dd)) { d0 = dd; break; }
         if (d0 < 0 || !G || !G.carAt) continue;
-        decal(X.speedText(v), [x + r[0] * (d0 + 1.45) + t[0] * 3, z + r[1] * (d0 + 1.45) + t[1] * 3], t, 1.7, 2.55);
+        // 標識の 3m 先から、横断歩道・停止線・ほかの文字と重ならない所まで、3m ずつ先へ（18m まで）
+        for (let a = 3; a <= 18; a += 3) if (decal(X.speedText(v), [x + r[0] * (d0 + 1.45) + t[0] * a, z + r[1] * (d0 + 1.45) + t[1] * a], t, 1.7, 2.55)) break;
       }
     }
     for (const [mat, B] of decals) {
@@ -9446,7 +9533,8 @@ class World {
         return;
       }
       const k = pos.length / 3;
-      for (const P of [A, B, C]) { pos.push(P[0], hy(P[0], P[1]) + lift, P[1]); col.push(cc.r, cc.g, cc.b); }
+      // 車道（地図の道路）の上にかかる所は、道路の面（地面＋5cm）より下へ。模型の駐車場などが道路にはみ出して、道路の線をおおっていた
+      for (const P of [A, B, C]) { pos.push(P[0], hy(P[0], P[1]) + (Town.carAtW(P[0], P[1]) ? Math.min(lift, 0.01) : lift), P[1]); col.push(cc.r, cc.g, cc.b); }
       const cr = (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0]);
       if (cr > 0) idx.push(k, k + 2, k + 1); else idx.push(k, k + 1, k + 2);
     };
@@ -9470,6 +9558,7 @@ class World {
         const nx = (b[1] - a[1]) / len * hw, nz = -(b[0] - a[0]) / len * hw, n = Math.max(1, Math.ceil(len / 2.5));
         for (let s = 0; s < n; s++) {
           const p = [a[0] + (b[0] - a[0]) * s / n, a[1] + (b[1] - a[1]) * s / n], q = [a[0] + (b[0] - a[0]) * (s + 1) / n, a[1] + (b[1] - a[1]) * (s + 1) / n];
+          if (Town.carAtW((p[0] + q[0]) / 2, (p[1] + q[1]) / 2)) continue;      // 模型の白線（駐車ますなど）は、車道の上には描かない
           const k = mp.length / 3, yp = hy(p[0], p[1]) + 0.09, yq = hy(q[0], q[1]) + 0.09;
           mp.push(p[0] + nx, yp, p[1] + nz, p[0] - nx, yp, p[1] - nz, q[0] - nx, yq, q[1] - nz, q[0] + nx, yq, q[1] + nz);
           const ax = mp[k * 3], az = mp[k * 3 + 2], bx = mp[k * 3 + 3], bz = mp[k * 3 + 5], cx = mp[k * 3 + 6], cz = mp[k * 3 + 8];
@@ -9511,7 +9600,8 @@ class World {
         return;
       }
       const k = pos.length / 3;
-      for (const P of [A, B, C]) { pos.push(P[0], hy(P[0], P[1]) + lift, P[1]); col.push(cc.r, cc.g, cc.b); }
+      // 車道（地図の道路）の上にかかる所は、道路の面（地面＋5cm）より下へ。模型の駐車場などが道路にはみ出して、道路の線をおおっていた
+      for (const P of [A, B, C]) { pos.push(P[0], hy(P[0], P[1]) + (Town.carAtW(P[0], P[1]) ? Math.min(lift, 0.01) : lift), P[1]); col.push(cc.r, cc.g, cc.b); }
       const cr = (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0]);
       if (cr > 0) idx.push(k, k + 2, k + 1); else idx.push(k, k + 1, k + 2);
     };
