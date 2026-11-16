@@ -3652,6 +3652,20 @@ const TYPE_COLORS = { elderly: 0xED6A14, student: 0x009BBF, commuter: 0x7C9D6C, 
 // ===== 町（基盤地図情報：地形・道路縁・建物・水域・鉄道・港の構造物、OpenStreetMap：土地利用）=====
 // 400m 四方のタイルを、2km ごとのまとまり（town/c_*.json）で必要になったときに読み込む。
 // 2つの表示（比較）で同じ形を使い回すため、形は1回だけ作る。
+// 小分けにした計算の順番待ち：タイルの組み立てなどの長い計算を、段階ごとに wait() で区切る。
+// 1 コマを描いたあと、決まった時間（budget。ふだん 7 ミリ秒、場所を大きく動いたときは 30 ミリ秒）までだけ進めて、残りは次のコマのあとに回す
+// （区切らないと、走行中に 1 コマが 0.1〜0.25 秒かかって引っかかる）。t0 は、コマを描き終えた時刻（frame が入れる）
+const Slots = {
+  q: [], t0: 0, budget: 7, busy: false,
+  wait() { return new Promise((r) => { this.q.push(r); this.kick(); }); },
+  kick() { if (this.busy || !this.q.length) return; this.busy = true; setTimeout(() => this.step(), 0); },
+  step() {
+    this.busy = false; if (!this.q.length) return;
+    const dt = performance.now() - this.t0;
+    if (dt < this.budget || dt > 400) { this.q.shift()(); this.kick(); }        // 400 ミリ秒より長くコマが描かれていないとき（画面が止まっている）は待たない
+    else { this.busy = true; requestAnimationFrame(() => setTimeout(() => this.step(), 0)); }
+  },
+};
 async function inflateB64(b64) {
   const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
   if (typeof DecompressionStream !== "undefined") {
@@ -3769,21 +3783,37 @@ function triRobust(rings0) {
     const A = Math.abs(ringArea(rings[0])) - rings.slice(1).reduce((t, r) => t + Math.abs(ringArea(r)), 0);
     return { rings, tris, err: Math.abs(s - A) / Math.max(1, A) };
   };
-  let best = tryTri(rings0);
-  if (best && best.err < 0.01) return best;
+  // 先に輪を掃除する（軽い）。分割（重い）は、たいてい 1 回ですむ
   const cl = rings0.map(cleanRing).filter((r, i) => i === 0 || r.length >= 3);
-  for (const rings of [cl, cl.map((r, i) => {
+  let best = tryTri(cl);
+  if (best && best.err < 0.01) return best;
+  const shrunk = () => cl.map((r, i) => {
     if (!i) return r;
     let cx = 0, cz = 0; for (const p of r) { cx += p[0] / r.length; cz += p[1] / r.length; }
     return r.map((p) => { const dx = p[0] - cx, dz = p[1] - cz, L = Math.hypot(dx, dz) || 1, f = Math.max(0, L - 0.03) / L; return [cx + dx * f, cz + dz * f]; });
-  })]) {
-    const r = tryTri(rings);
+  });
+  for (const mk of [shrunk, () => rings0]) {
+    const r = tryTri(mk());
     if (r && (!best || r.err < best.err)) best = r;
     if (best && best.err < 0.01) break;
   }
   return best || { rings: rings0, tris: [] };
 }
 // ===/TRIROBUST===
+// 凸多角形 P（[x, z] の列）を、四角 x0〜x1・z0〜z1 で切る（向きはそのまま）
+function clipRect(P, x0, z0, x1, z1) {
+  for (const [ax, lim, sg] of [[0, x0, 1], [0, x1, -1], [1, z0, 1], [1, z1, -1]]) {
+    if (P.length < 3) return [];
+    const ins = (p) => (p[ax] - lim) * sg >= 0, out = [];
+    for (let i = 0; i < P.length; i++) {
+      const S = P[(i + P.length - 1) % P.length], E = P[i];
+      const I = () => { const t = (lim - S[ax]) / (E[ax] - S[ax]); return [S[0] + (E[0] - S[0]) * t, S[1] + (E[1] - S[1]) * t]; };
+      if (ins(E)) { if (!ins(S)) out.push(I()); out.push(E); } else if (ins(S)) out.push(I());
+    }
+    P = out;
+  }
+  return P.length >= 3 ? P : [];
+}
 // 凸多角形を、地面の三角形（4m の格子と、右上がりの対角線）の境で切り分ける。切った小片は、どれも地面の三角形 1 枚の上にのる
 // （道路の面・区画線を地面の高さに貼るとき、地面が突き抜けたり、線が浮いたり沈んだりしない）。座標は町の座標でも、タイルの中の座標でもよい（境の線は同じ）
 function drapeGrid(tri, cb) {
@@ -3818,6 +3848,25 @@ function triH(H, fx, fz) {
   return u + v <= 1 ? a + (b - a) * u + (d - a) * v : e + (d - e) * (1 - u) + (b - e) * (1 - v);
 }
 
+// 乱数の模様の画像（128×128。くり返して使う）。シェーダーの中で式から乱数を作ると、描画プログラムの準備（コンパイル）が重く、
+// 町が最初に出るときに合計 8 秒ほど画面が止まっていた（地面 1.4 秒 × 2、木 0.9 秒、空 0.7 秒、道路 0.6 秒…）。画像から読めば 1 回の参照ですむ
+//   nzH(p)：升 floor(p) ごとの乱数（0〜1）。nzV(p)：升の角の乱数をなめらかにつないだ値（むら）
+const NoiseTex = {
+  tex: null,
+  get() {
+    if (!this.tex) {
+      const n = 128, a = new Uint8Array(n * n * 4); let s = 20261115;
+      for (let i = 0; i < a.length; i++) { s = (s * 16807) % 2147483647; a[i] = (s >>> 8) & 255; }
+      const t = new THREE.DataTexture(a, n, n, THREE.RGBAFormat);
+      t.wrapS = t.wrapT = THREE.RepeatWrapping; t.magFilter = t.minFilter = THREE.LinearFilter; t.generateMipmaps = false; t.needsUpdate = true;
+      this.tex = t;
+    }
+    return this.tex;
+  },
+};
+const NOISE_GLSL = `uniform sampler2D uNoiseT;
+  float nzH(vec2 p) { return texture2D(uNoiseT, (mod(floor(p), 128.0) + 0.5) / 128.0).r; }
+  float nzV(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f); return texture2D(uNoiseT, (mod(i, 128.0) + f + 0.5) / 128.0).r; }`;
 const Town = {
   models: new Map(),
   index: null, base: "", tileChunk: new Map(), chunkState: new Map(), raw: new Map(), heights: new Map(),
@@ -3837,7 +3886,7 @@ const Town = {
     if (!st) {
       this.chunkState.set(c.f, "loading");
       fetch(this.base + c.f).then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); }).then(async (d) => {
-        for (const t of d.tiles) {
+        await Promise.all(d.tiles.map(async (t) => {
           const k = t.k[0] + "," + t.k[1];
           const hb = await inflateB64(t.h);
           const a = new Int16Array(hb.buffer, hb.byteOffset, hb.byteLength >> 1);
@@ -3845,7 +3894,7 @@ const Town = {
           for (let i = 0; i < GN; i++) { let v = 0; for (let j = 0; j < GN; j++) { v += a[i * GN + j]; H[i * GN + j] = v / 10; } }
           this.heights.set(k, H);
           this.raw.set(k, t);
-        }
+        }));
         this.chunkState.set(c.f, "ok");
       }).catch((e) => { console.warn("town chunk", c.f, e); this.chunkState.set(c.f, "error"); });
     }
@@ -3942,25 +3991,24 @@ const Town = {
     // タイルごとに材質を分けるので、タイルごとの値（農地の地図・タイルの左上）は材質の userData から渡す（function で書き、this＝その材質）
     ground.onBeforeCompile = function (sh) {
       const ud = this.userData || {};
-      sh.uniforms.uWet = groundU.uWet; sh.uniforms.uSeaT = SkyU.uTime; sh.uniforms.uDeepG = groundU.uDeepG;
+      sh.uniforms.uWet = groundU.uWet; sh.uniforms.uSeaT = SkyU.uTime; sh.uniforms.uDeepG = groundU.uDeepG; sh.uniforms.uNoiseT = { value: NoiseTex.get() };
       sh.uniforms.uField = ud.uField || { value: noField };
       sh.uniforms.uFieldOn = ud.uFieldOn || { value: 0 };
       sh.uniforms.uTileO = ud.uTileO || { value: new THREE.Vector2() };
       sh.uniforms.uWater = ud.uWater || { value: noField };
       sh.uniforms.uWaterOn = ud.uWaterOn || { value: 0 };
-      sh.vertexShader = sh.vertexShader.replace("#include <common>", "#include <common>\nvarying vec2 vGXZ; varying float vGY;")
-        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvGXZ = (modelMatrix * vec4(transformed, 1.0)).xz; vGY = (modelMatrix * vec4(transformed, 1.0)).y;");
+      sh.vertexShader = sh.vertexShader.replace("#include <common>", "#include <common>\nattribute float aShade; varying float vShade; varying vec2 vGXZ; varying float vGY;")
+        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvShade = aShade; vGXZ = (modelMatrix * vec4(transformed, 1.0)).xz; vGY = (modelMatrix * vec4(transformed, 1.0)).y;");
       sh.fragmentShader = sh.fragmentShader.replace("#include <common>", `#include <common>
-        varying vec2 vGXZ; varying float vGY; uniform float uWet, uSeaT; uniform vec3 uDeepG;
+        varying vec2 vGXZ; varying float vGY; varying float vShade; uniform float uWet, uSeaT; uniform vec3 uDeepG;
         uniform sampler2D uField; uniform float uFieldOn; uniform vec2 uTileO;
         uniform sampler2D uWater; uniform float uWaterOn;
-        float gh(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-        // 細かい模様のための乱数（町の座標は数千 m あるので、sin を使わない式）
-        float gh2(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-        float gn2(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
-          return mix(mix(gh2(i), gh2(i + vec2(1, 0)), f.x), mix(gh2(i + vec2(0, 1)), gh2(i + vec2(1, 1)), f.x), f.y); }
-        float gn(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
-          return mix(mix(gh(i), gh(i + vec2(1, 0)), f.x), mix(gh(i + vec2(0, 1)), gh(i + vec2(1, 1)), f.x), f.y); }
+        ${NOISE_GLSL}
+        // 乱数とむら（画像から読む）。gh2・gn2 は、gh・gn と重ならない別の場所を読む
+        float gh(vec2 p) { return nzH(p); }
+        float gh2(vec2 p) { return nzH(p + 41.0); }
+        float gn2(vec2 p) { return nzV(p + 67.0); }
+        float gn(vec2 p) { return nzV(p); }
         vec3 sRGB(float r, float g, float b) { return pow(vec3(r, g, b), vec3(2.2)); }
         // 細かい縞：遠くでは縞が画面の点より細かくなってちらつくので、平均の色へなじませる（w＝縞の間隔が画面で何点分か）
         float stripe(float t, float duty, float w) { float s = smoothstep(duty - 0.08, duty + 0.08, abs(fract(t) - 0.5) * 2.0); return mix(1.0 - duty, s, clamp(1.6 - w * 2.2, 0.0, 1.0)); }
@@ -4043,6 +4091,12 @@ const Town = {
           diffuseColor.rgb *= 1.0 + det * mix(0.7, 1.3, grassy);
           diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.20, 1.14, 0.70), grassy * smoothstep(0.55, 0.85, f2) * 0.6 * k2);
         }
+        if (vShade > 0.01) {
+          // 森の中：木の下は暗い（落ち葉と下草の、こい緑がかった茶色）。木もれ日のまだら
+          float fs = smoothstep(0.05, 0.8, vShade);
+          vec3 floorC = vec3(0.050, 0.070, 0.034) * (0.75 + 0.6 * gn2(vGXZ * 0.8)) + vec3(0.05, 0.05, 0.02) * smoothstep(0.72, 0.9, gn2(vGXZ * 0.35 + 3.0));
+          diffuseColor.rgb = mix(diffuseColor.rgb, floorC, fs * 0.8);
+        }
         float nz = gn(vGXZ * 0.9) * 0.5 + gn(vGXZ * 0.13) * 0.35 + gn(vGXZ * 0.021) * 0.15;
         diffuseColor.rgb *= 0.86 + 0.26 * nz;
         diffuseColor.rgb *= 1.0 - 0.28 * uWet;
@@ -4062,19 +4116,20 @@ const Town = {
           diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.90, 0.93, 0.93), clamp(foam, 0.0, 1.0) * 0.85);
         }`);
     };
-    ground.customProgramCacheKey = () => "ground-v12";
+    ground.customProgramCacheKey = () => "ground-v14";
     this.groundU = groundU;
     // 道路：アスファルトの細かいむら・つぎはぎ（町に固定した模様）。模様が無いと、追いかける視点では地面が流れて見えず、速さが分かりにくい
     const road = lam({ vertexColors: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 });
     road.onBeforeCompile = (sh) => {
+      sh.uniforms.uNoiseT = { value: NoiseTex.get() };
       sh.vertexShader = sh.vertexShader.replace("#include <common>", "#include <common>\nvarying vec2 vRXZ;")
         .replace("#include <begin_vertex>", "#include <begin_vertex>\nvRXZ = (modelMatrix * vec4(transformed, 1.0)).xz;");
       sh.fragmentShader = sh.fragmentShader.replace("#include <common>", `#include <common>
         varying vec2 vRXZ;
         // 乱数（升の番号から）：町の座標は数千 m あるので、sin を使う式では精度が足りず模様がつぶれる。掛け算と fract だけの式にする
-        float rh(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-        float rn(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
-          return mix(mix(rh(i), rh(i + vec2(1, 0)), f.x), mix(rh(i + vec2(0, 1)), rh(i + vec2(1, 1)), f.x), f.y); }`)
+        ${NOISE_GLSL}
+        float rh(vec2 p) { return nzH(p); }
+        float rn(vec2 p) { return nzV(p); }`)
         .replace("#include <color_fragment>", `#include <color_fragment>
         {
           vec2 p = vRXZ;
@@ -4117,20 +4172,20 @@ const Town = {
           diffuseColor.rgb = mix(asph, side, walk);
         }`);
     };
-    road.customProgramCacheKey = () => "road-v5";
+    road.customProgramCacheKey = () => "road-v6";
     road.side = THREE.DoubleSide;     // 川・水路の上を通る所で、下から見ても抜けないように
     // 川・池の水面：濁った緑がかった色。さざ波（流れる向きのある波を重ねる）で光を散らし、浅い角度では空の色を映す
     const waterU = { uTime: { value: 0 }, uSky: { value: new THREE.Color(0xC6D6DE) } };
     this.waterU = waterU;
     const water = new THREE.MeshPhongMaterial({ color: 0x45625B, specular: 0x8d9a9c, shininess: 60 });
     water.onBeforeCompile = (sh) => {
-      sh.uniforms.uTime = waterU.uTime; sh.uniforms.uSky = waterU.uSky;
+      sh.uniforms.uTime = waterU.uTime; sh.uniforms.uSky = waterU.uSky; sh.uniforms.uNoiseT = { value: NoiseTex.get() };
       sh.vertexShader = sh.vertexShader.replace("#include <common>", "#include <common>\nvarying vec2 vWXZ;")
         .replace("#include <begin_vertex>", "#include <begin_vertex>\nvWXZ = (modelMatrix * vec4(transformed, 1.0)).xz;");
       sh.fragmentShader = sh.fragmentShader.replace("#include <common>", `#include <common>
         varying vec2 vWXZ; uniform float uTime; uniform vec3 uSky;
-        float wh(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-        float wn(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f); return mix(mix(wh(i), wh(i + vec2(1, 0)), f.x), mix(wh(i + vec2(0, 1)), wh(i + vec2(1, 1)), f.x), f.y); }`)
+        ${NOISE_GLSL}
+        float wn(vec2 p) { return nzV(p); }`)
         .replace("#include <normal_fragment_maps>", `#include <normal_fragment_maps>
         {
           vec2 p = vWXZ + (vec2(wn(vWXZ * 0.25), wn(vWXZ * 0.25 + 7.0)) - 0.5) * 4.0;
@@ -4149,7 +4204,7 @@ const Town = {
         outgoingLight = mix(outgoingLight, uSky * 0.92, clamp(0.05 + fr * 0.8, 0.0, 0.85));
         #include <opaque_fragment>`);
     };
-    water.customProgramCacheKey = () => "water-v1";
+    water.customProgramCacheKey = () => "water-v2";
     const bld = behindBus(lam({ vertexColors: true, map: this.facadeAtlas(), emissiveMap: this.atlasE, emissive: 0x000000 }));
     // 灯りのついている窓：壁の 3.6m の区切り・階・家（壁の色）ごとに決める。4 割ほどの窓が灯り、明るさも少しずつちがう
     bld.onBeforeCompile = (sh) => {
@@ -4165,7 +4220,7 @@ const Town = {
     // 逆光で透ける明るさ、風のゆっくりした揺れ（木ごと・高さごとにずれる）
     const tree = behindBus(lam({ vertexColors: true }));
     tree.onBeforeCompile = (sh) => {
-      sh.uniforms.uTreeT = SkyU.uTime;
+      sh.uniforms.uTreeT = SkyU.uTime; sh.uniforms.uNoiseT = { value: NoiseTex.get() };
       sh.vertexShader = sh.vertexShader.replace("#include <common>", "#include <common>\nattribute float aLeaf; varying float vLeaf; varying vec3 vTW; uniform float uTreeT;")
         .replace("#include <begin_vertex>", `#include <begin_vertex>
           vLeaf = aLeaf;
@@ -4179,10 +4234,8 @@ const Town = {
           #endif`);
       sh.fragmentShader = sh.fragmentShader.replace("#include <common>", `#include <common>
         varying float vLeaf; varying vec3 vTW;
-        float th(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.zyx + 31.32); return fract((p.x + p.y) * p.z); }
-        float tn(vec3 p) { vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
-          return mix(mix(mix(th(i), th(i + vec3(1, 0, 0)), f.x), mix(th(i + vec3(0, 1, 0)), th(i + vec3(1, 1, 0)), f.x), f.y),
-                     mix(mix(th(i + vec3(0, 0, 1)), th(i + vec3(1, 0, 1)), f.x), mix(th(i + vec3(0, 1, 1)), th(i + vec3(1, 1, 1)), f.x), f.y), f.z); }`)
+        ${NOISE_GLSL}
+        float tn(vec3 p) { float i = floor(p.y), f = fract(p.y); f = f * f * (3.0 - 2.0 * f); return mix(nzV(p.xz + i * 37.0), nzV(p.xz + (i + 1.0) * 37.0), f); }`)
         .replace("#include <color_fragment>", `#include <color_fragment>
         if (vLeaf > 0.5) {
           float fwT = length(fwidth(vTW));
@@ -4197,7 +4250,7 @@ const Town = {
         #endif
         #include <opaque_fragment>`);
     };
-    tree.customProgramCacheKey = () => "tree-v1";
+    tree.customProgramCacheKey = () => "tree-v2";
     const mark = new THREE.MeshLambertMaterial({ color: 0xF4F4F0, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
     this.mats = {
       ground, road, bld, tree, mark, behindBus, water,
@@ -4420,6 +4473,26 @@ const Town = {
     this.trees = { broad, pine, mikan, fruit };
     return this.trees;
   },
+  // 交通のデータ（traffic.json）の線と形を、通るタイルごとにまとめる。データでは、線は始まりのタイルにまとめて入っていて、
+  // となりのタイルへ最大 540m はみ出すものがある。タイルごとに、そのタイルの四角で切って、そのタイルの地面に貼るために使う
+  trafficOf(key) {
+    const TR = this.traffic; if (!TR) return {};
+    if (!this._trIdx) {
+      const idx = (this._trIdx = new Map()), ts = TR.tile;
+      for (const k in TR.t) {
+        const v = TR.t[k];
+        for (const nm of ["yl", "wl", "sl", "cw", "xb"]) for (const l of v[nm] || []) {
+          let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+          for (let i = 0; i + 1 < l.length && (nm !== "sl" || i < 4); i += 2) { x0 = Math.min(x0, l[i]); x1 = Math.max(x1, l[i]); z0 = Math.min(z0, l[i + 1]); z1 = Math.max(z1, l[i + 1]); }
+          for (let i = Math.floor(x0 / ts); i <= Math.floor(x1 / ts); i++) for (let j = Math.floor(z0 / ts); j <= Math.floor(z1 / ts); j++) {
+            const kk = i + "," + j; if (!idx.has(kk)) idx.set(kk, {});
+            const o = idx.get(kk); (o[nm] = o[nm] || []).push(l);
+          }
+        }
+      }
+    }
+    return this._trIdx.get(key) || {};
+  },
   // 川・池・水路（data/water.json）：タイルの中の形を作る
   //   ・地面に穴をあける地図（1m ごと。R＝川・池、G＝岸のまわり 6m、B＝水路）と、その場所の水の種類 at(lx, lz)（0 なし・1 川・池・2 水路）
   //   ・水面（岸の高さから決めた水位。点ごと）。岸の壁（間知ブロック。下ほど水の側へ出る勾配）と、天端のコンクリート（幅 0.5m）。池はゆるい勾配
@@ -4605,8 +4678,18 @@ const Town = {
     if (this.geo.has(key)) return this.geo.get(key);
     const t = this.raw.get(key), H = this.heights.get(key);
     if (!t || !H) return null;
+    // 圧縮したデータ（道路・区画線・橋・建物・森・線路・岸壁）を、先にまとめて並行で解凍しておく。
+    // 解凍は 1 回ごとに数十ミリ秒の待ちがあるので、使う所で 1 つずつ待つと、タイル 1 枚に 0.3〜1 秒かかる
+    const INF = {};
+    await Promise.all(["car", "alley", "side", "med", "mk", "mkd", "br", "b", "f", "hb", "rl", "rx"].filter((n) => typeof t[n] === "string").map(async (n) => { INF[n] = await inflateB64(t[n]); }));
+    if (this.geo.has(key)) return this.geo.get(key);
+    await Slots.wait();
     const ts = this.tile, ox = t.k[0] * ts, oz = t.k[1] * ts;
     const out = { key, ox, oz, refs: 0, used: this.frame };
+    // 木・田畑を置かない所（施設の敷地・線路ぞい）のうち、このタイルにかかるものだけを先に選ぶ（升ごとに町全体の一覧を調べると遅い）
+    this.treeBlocked(ox, oz);
+    const CLR = (this._clr || []).filter((c) => c.x1 >= ox && c.x0 <= ox + ts && c.z1 >= oz && c.z0 <= oz + ts);
+    const blockedL = (wx, wz) => { for (const c of CLR) if (wx >= c.x0 && wx <= c.x1 && wz >= c.z0 && wz <= c.z1 && c.f(wx, wz)) return true; return false; };
     // 道路の上の標高をならす：標高の元のデータ（5m）の細かいぶれで、道路の面が波打って見え、区画線もゆがんでいた。
     // 道路（車道・歩道・路地）にかかる点だけを、まわりの道路の点との重みつき平均（1-2-1）にする（2 回）。道路の外の点は使わないので、
     // 切り通しや土手の斜面には引っぱられない。タイルのふちの点は、となりのタイルと同じ値のままにする（すき間ができないように）
@@ -4615,7 +4698,7 @@ const Town = {
       const cv = document.createElement("canvas"); cv.width = cv.height = GN;
       const g2 = cv.getContext("2d", { willReadFrequently: true });
       g2.setTransform(1 / GS, 0, 0, 1 / GS, 0.5, 0.5); g2.fillStyle = "#fff"; g2.strokeStyle = "#fff"; g2.lineWidth = 2;
-      for (const nm of ["car", "side", "alley"]) if (t[nm]) for (const rings of readPolys(await inflateB64(t[nm]))) { g2.beginPath(); for (const r of rings) { r.forEach((p, i) => (i ? g2.lineTo(p[0], p[1]) : g2.moveTo(p[0], p[1]))); g2.closePath(); } g2.fill("evenodd"); g2.stroke(); }
+      for (const nm of ["car", "side", "alley"]) if (t[nm]) for (const rings of readPolys(INF[nm])) { g2.beginPath(); for (const r of rings) { r.forEach((p, i) => (i ? g2.lineTo(p[0], p[1]) : g2.moveTo(p[0], p[1]))); g2.closePath(); } g2.fill("evenodd"); g2.stroke(); }
       const px = g2.getImageData(0, 0, GN, GN).data, rd = new Uint8Array(GN * GN);
       for (let i = 0; i < GN * GN; i++) rd[i] = px[i * 4 + 3] > 60 ? 1 : 0;
       for (let it = 0; it < 2; it++) {
@@ -4644,13 +4727,37 @@ const Town = {
         fpix = g2.getImageData(0, 0, 200, 200).data;
       } catch (e) { fpix = null; }
       // 施設の敷地（scenery.json の clear）と線路の上は、田畑にしない
-      if (fpix) for (let r = 0; r < 200; r++) for (let c = 0; c < 200; c++) { const k4 = (r * 200 + c) * 4; if (fpix[k4] && this.treeBlocked(ox + c * 2 + 1, oz + r * 2 + 1)) fpix[k4] = 0; }
+      if (fpix) for (let r = 0; r < 200; r++) for (let c = 0; c < 200; c++) { const k4 = (r * 200 + c) * 4; if (fpix[k4] && blockedL(ox + c * 2 + 1, oz + r * 2 + 1)) fpix[k4] = 0; }
     }
     const fieldAt = (lx, lz) => { if (!fpix) return 0; const c = Math.min(199, Math.max(0, Math.floor(lx / 2))), r = Math.min(199, Math.max(0, Math.floor(lz / 2))); return Math.round(fpix[(r * 200 + c) * 4] / 85); };
     // 温室（ビニールハウス）：OSM の区画（中心 x・z、長さ、幅、向き）。基盤地図情報では「無壁舎」になっているので、重なる無壁舎は描かない
     const GH = ((FD && FD.gh && FD.gh[key]) || []).slice();
     const inGH = (x, z, pad = 1.5) => GH.some(([cx, cz, L, Wd, ang]) => { const dx = Math.cos(ang), dz = Math.sin(ang), a = (x - cx) * dx + (z - cz) * dz, b = -(x - cx) * dz + (z - cz) * dx; return Math.abs(a) <= L / 2 + pad && Math.abs(b) <= Wd / 2 + pad; });
     const ghExtra = [];
+    // 森の印（4m ごとの升）。木を置く升（海ぎわ・田畑・施設の敷地・線路を除く）から、地面の点ごとの「木のかぶさり」（0〜1）を作る：
+    // 点のまわり 4 升の平均を、となりの点とならす。木の下の地面を暗くするのに使う（遠くの森では木の影が出ないので、木が浮いて見えていた）
+    const fbF = t.f ? INF.f : null;
+    const shade = new Float32Array(GN * GN);
+    if (fbF) {
+      const cell = new Uint8Array(100 * 100);
+      for (let r = 0; r < 100; r++) for (let c = 0; c < 100; c++) {
+        const k = r * 100 + c; if (!((fbF[k >> 3] >> (7 - (k & 7))) & 1)) continue;
+        const lx = (c + 0.5) * 4, lz = (r + 0.5) * 4;
+        if (hL(lx, lz) < 0.4 || fieldAt(lx, lz) || blockedL(ox + lx, oz + lz)) continue;
+        cell[k] = 1;
+      }
+      const raw = new Float32Array(GN * GN);
+      for (let r = 0; r < GN; r++) for (let c = 0; c < GN; c++) {
+        let s = 0, n = 0;
+        for (const rr of [r - 1, r]) for (const cc of [c - 1, c]) if (rr >= 0 && cc >= 0 && rr < 100 && cc < 100) { s += cell[rr * 100 + cc]; n++; }
+        raw[r * GN + c] = n ? s / n : 0;
+      }
+      for (let r = 0; r < GN; r++) for (let c = 0; c < GN; c++) {
+        let s = 0, w = 0;
+        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) { const rr = r + dr, cc = c + dc; if (rr < 0 || cc < 0 || rr >= GN || cc >= GN) continue; const ww = (dr ? 1 : 2) * (dc ? 1 : 2); s += raw[rr * GN + cc] * ww; w += ww; }
+        shade[r * GN + c] = s / w;
+      }
+    }
     // --- 地面（4m 格子）。深い海の底は描かない
     {
       const pos = new Float32Array(GN * GN * 3), nor = new Float32Array(GN * GN * 3), uv = new Float32Array(GN * GN * 2);
@@ -4670,6 +4777,7 @@ const Town = {
       }
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.BufferAttribute(pos, 3)); g.setAttribute("normal", new THREE.BufferAttribute(nor, 3)); g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+      g.setAttribute("aShade", new THREE.BufferAttribute(shade, 1));
       g.setIndex(idx); g.computeBoundingSphere();
       out.ground = g;
       const tex = new THREE.TextureLoader().load(t.tex);
@@ -4679,10 +4787,11 @@ const Town = {
       let ft = null;
       if (fpix) { ft = new THREE.DataTexture(new Uint8Array(fpix), 200, 200, THREE.RGBAFormat); ft.magFilter = ft.minFilter = THREE.NearestFilter; ft.generateMipmaps = false; ft.needsUpdate = true; }
       m.userData = { uField: { value: ft || this.noField }, uFieldOn: { value: ft ? 1 : 0 }, uTileO: { value: new THREE.Vector2(ox, oz) }, uWater: { value: WT && WT.tex ? WT.tex : this.noField }, uWaterOn: { value: WT && WT.tex ? 1 : 0 } };
-      if (WT && WT.tex) { m.side = THREE.DoubleSide; out.waterTex = WT.tex; }     // 水の所の穴のふちで、地面の裏が見えても抜けないように
+      if (WT && WT.tex) out.waterTex = WT.tex;
       out.fieldTex = ft;
       out.groundMat = m;
     }
+    await Slots.wait();
     // --- 道路の面：車道・歩道（15cm 高い）・中央分離帯
     if (t.car) {
       const pos = [], col = [], idx = [];
@@ -4715,7 +4824,7 @@ const Town = {
       // 橋の床（先に読んで、橋の上の区画線の高さを床の面から求める）
       const decks = [];
       if (t.br) {
-        const u8 = await inflateB64(t.br), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        const u8 = INF.br, dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
         let o = 0; const np = dv.getUint16(o, true); o += 2;
         for (let q = 0; q < np; q++) {
           const nr = dv.getUint8(o); o += 1;
@@ -4744,9 +4853,21 @@ const Town = {
       }
       for (const [a, b] of joints) for (const p of [a, b]) { const h = hL(p[0], p[1]) + 0.05; if (h > p[2] && h - p[2] < 0.6) p[2] = h; }
       const RAMP = 3.0;
+      // つなぎ目を 4m の升に登録しておく（つなぎ目から 3m 以内にかかる升）。道路の頂点 1 つごとに全部のつなぎ目を調べると、
+      // 橋の多いタイルでは、組み立ての時間の半分以上がこの計算になっていた
+      const jgrid = new Map(), jkey = (cx, cz) => (cx + 8) * 1024 + (cz + 8);
+      for (const J of joints) {
+        const [a, b] = J;
+        for (let cx = Math.floor((Math.min(a[0], b[0]) - RAMP) / 4); cx <= Math.floor((Math.max(a[0], b[0]) + RAMP) / 4); cx++)
+          for (let cz = Math.floor((Math.min(a[1], b[1]) - RAMP) / 4); cz <= Math.floor((Math.max(a[1], b[1]) + RAMP) / 4); cz++) {
+            const k = jkey(cx, cz); if (!jgrid.has(k)) jgrid.set(k, []); jgrid.get(k).push(J);
+          }
+      }
       const adjY = (x, z, y, extra = 0) => {
+        const near = jgrid.get(jkey(Math.floor(x / 4), Math.floor(z / 4)));
+        if (!near) return y;
         let best = y;
-        for (const [a, b] of joints) {
+        for (const [a, b] of near) {
           const ex = b[0] - a[0], ez = b[1] - a[1], L2 = ex * ex + ez * ez || 1;
           const u = Math.max(0, Math.min(1, ((x - a[0]) * ex + (z - a[1]) * ez) / L2));
           const d = Math.hypot(x - (a[0] + ex * u), z - (a[1] + ez * u));
@@ -4758,7 +4879,7 @@ const Town = {
         }
         return best;
       };
-      const PCar = readPolys(await inflateB64(t.car)), PAl = t.alley ? readPolys(await inflateB64(t.alley)) : [], PSd = readPolys(await inflateB64(t.side));
+      const PCar = readPolys(INF.car), PAl = t.alley ? readPolys(INF.alley) : [], PSd = readPolys(INF.side);
       // 道路の面の地図（1m ごと）：川の上で、道路の外の端かどうかを調べる（タイルに川があるときだけ）
       let roadCov = null;
       if ((WT && WT.any1) || decks.length) {
@@ -4844,8 +4965,9 @@ const Town = {
         }
         return null;
       };
+      await Slots.wait();
       // 区画線（中央線・外側線）：なめらかな線を 1m ごとの帯にして、道路の面と同じように地面に貼る
-      const TRt = Town.traffic && Town.traffic.t[t.k[0] + "," + t.k[1]];
+      const TRt = this.trafficOf(key);
       const XB = ((TRt && TRt.xb) || []).map((r) => { const R_ = []; for (let i = 0; i + 1 < r.length; i += 2) R_.push([r[i] - ox, r[i + 1] - oz]); return R_; });
       const inBand = (x, z) => XB.some((R_) => { let c = false; for (let i = 0, j = R_.length - 1; i < R_.length; j = i++) { const a = R_[i], b = R_[j]; if ((a[1] > z) !== (b[1] > z) && x < (b[0] - a[0]) * (z - a[1]) / (b[1] - a[1]) + a[0]) c = !c; } return c; });
       const CW = (TRt && TRt.cw) || [];
@@ -4874,7 +4996,7 @@ const Town = {
           }
         };
         if (t.mk) {
-          const u8 = await inflateB64(t.mk), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+          const u8 = INF.mk, dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
           let o = 0; const nl = dv.getUint16(o, true); o += 2;
           for (let q = 0; q < nl; q++) {
             const np = dv.getUint16(o, true), w = dv.getUint8(o + 2) / 100; o += 4;
@@ -4885,7 +5007,7 @@ const Town = {
           }
         }
         if (t.mkd) {
-          const u8 = await inflateB64(t.mkd), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+          const u8 = INF.mkd, dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
           let o = 0; const nl = dv.getUint16(o, true); o += 2;
           for (let q = 0; q < nl; q++) {
             const np = dv.getUint16(o, true), w = dv.getUint8(o + 2) / 100; o += 4;
@@ -4904,7 +5026,8 @@ const Town = {
             for (const tri of [[A, B, C], [A, C, D]]) {
               const cr = (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1]) - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0]);
               if (cr > 0) { const tmp = tri[1]; tri[1] = tri[2]; tri[2] = tmp; }
-              drape(tri, (Q) => { const base = mpos.length / 3; for (const r2 of Q) mpos.push(ox + r2[0], adjY(r2[0], r2[1], hL(r2[0], r2[1]) + 0.075, 0.025), oz + r2[1]); for (let j = 1; j + 1 < Q.length; j++) midx.push(base, base + j, base + j + 1); });
+              const tc = clipRect(tri, 0, 0, ts, ts); if (!tc.length) continue;
+              drape(tc, (Q) => { const base = mpos.length / 3; for (const r2 of Q) mpos.push(ox + r2[0], adjY(r2[0], r2[1], hL(r2[0], r2[1]) + 0.075, 0.025), oz + r2[1]); for (let j = 1; j + 1 < Q.length; j++) midx.push(base, base + j, base + j + 1); });
             }
           }
         }
@@ -4917,10 +5040,13 @@ const Town = {
         return ins;
       };
       out.surfY = (wx, wz, lift) => {
-        const lx = wx - ox, lz = wz - oz, g0 = hL(lx, lz);
+        const lx = wx - ox, lz = wz - oz;
+        if (lx < -0.05 || lz < -0.05 || lx > ts + 0.05 || lz > ts + 0.05) { const h = Town.hAt(wx, wz); if (h != null) return h + lift; }
+        const g0 = hL(lx, lz);
         if (decks.length) { const dy = deckY(lx, lz); if (dy != null && dy - g0 < 4.5) return dy + lift - 0.045; }
         return adjY(lx, lz, g0 + lift, lift - 0.05);
       };
+      await Slots.wait();
       // 橋：床（ならした道路の高さ）・桁（床の下 1m）・川の側の欄干（高さ 1m）
       if (decks.length) {
         const cDeck = new THREE.Color(0x63676C), cGir = new THREE.Color(0xA9A6A0), cRail = new THREE.Color(0xCFCDC7), cCurb = new THREE.Color(0xB8B4AC);
@@ -4979,9 +5105,10 @@ const Town = {
         out.road = g;
       }
     }
+    await Slots.wait();
     // --- 建物：小さな家（四角形）は切妻屋根、ほかは平らな屋根。屋根と壁の色は家ごとに少しずつ変える
     if (t.nb) {
-      const u8 = await inflateB64(t.b), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      const u8 = INF.b, dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
       const pos = [], nor = [], col = [], uvs = [];
       const ROOF = [0x4D525A, 0x3F4B5B, 0x5A4C44, 0x6E7176, 0x4F5A4E, 0x7A4536, 0x8A8E93];
       const WALL = [0xEEE9E0, 0xE4DDD0, 0xD9D3C7, 0xD0C9BC, 0xCDBEA6, 0xB9A68B, 0xE8E4DC];
@@ -5248,9 +5375,10 @@ const Town = {
       g.computeBoundingSphere();
       out.bld = g;
     }
+    await Slots.wait();
     // --- 森の木（4m ごとの森の印から、場所で決まる乱数で並べる）
     {
-      const fb = await inflateB64(t.f);
+      const fb = fbF;
       const list = { broad: [], pine: [] };
       for (let r = 0; r < 100; r++) for (let c = 0; c < 100; c++) {
         const k = r * 100 + c;
@@ -5261,7 +5389,7 @@ const Town = {
         const h = hL(lx, lz);
         if (h < 0.4) continue;
         if (fieldAt(lx, lz)) continue;       // 田・畑・果樹園（もとのデータでは森になっていた所がある）
-        if (Town.treeBlocked(ox + lx, oz + lz)) continue;   // 施設の敷地・線路
+        if (blockedL(ox + lx, oz + lz)) continue;   // 施設の敷地・線路
         const kind = (h < 9 && hash3(c, r, 5) < 0.35) || hash3(r, c, 9) < 0.12 ? "pine" : "broad";
         list[kind].push([ox + lx, h - 0.2, oz + lz, 0.75 + hash3(c, r, 3) * 0.6, hash3(r, c, 4) * 6.28, hash3(c + 1, r, 6)]);
       }
@@ -5319,13 +5447,13 @@ const Town = {
           if (i) { const k = base + (i - 1) * 2; idx.push(k, k + 1, k + 2, k + 1, k + 3, k + 2); }
         }
       };
-      for (const line of readLines(await inflateB64(t.rl))) {
+      for (const line of readLines(INF.rl)) {
         if (line.length < 2) continue;
         strip(line, 0, 3.2, 0.12, 0x8A8076);
         strip(line, -0.55, 0.09, 0.32, 0x7A7F86); strip(line, 0.55, 0.09, 0.32, 0x7A7F86);
       }
       // 踏切：道路の面にうまったレール
-      if (t.rx) for (const line of readLines(await inflateB64(t.rx))) {
+      if (t.rx) for (const line of readLines(INF.rx)) {
         if (line.length < 2) continue;
         strip(line, -0.55, 0.08, 0.075, 0x8C9096); strip(line, 0.55, 0.08, 0.075, 0x8C9096);
       }
@@ -5335,7 +5463,7 @@ const Town = {
     if (t.hb) {
       const pos = [], idx = [], uvs = [];
       const tIdx = [], sIdx = [];
-      for (const rings of readPolys(await inflateB64(t.hb))) {
+      for (const rings of readPolys(INF.hb)) {
         const P = rings[0]; if (P.length < 3) continue;
         // となりの陸（形のまわり 3m の外と角。標高 0.3m より高い所）の高さのまん中。陸につながっていない防波堤は 2.0m
         const land = [];
@@ -8606,16 +8734,19 @@ const SkyU = {
     new THREE.Vector4(31104, 6213, 3800, 250),   // 渥美半島：蔵王山
   ] },
   uVis: { value: 14000 },                        // 島影がかすむ距離（m）。天気で変える
+  uNoiseT: { value: null },                      // 乱数の模様の画像（空と海の材質を作るときに入れる）
 };
 const SKY_NOISE = `
-  float sh(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
-  float sn(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f); return mix(mix(sh(i), sh(i + vec2(1, 0)), f.x), mix(sh(i + vec2(0, 1)), sh(i + vec2(1, 1)), f.x), f.y); }
+  ${NOISE_GLSL}
+  float sh(vec2 p) { return nzH(p); }
+  float sn(vec2 p) { return nzV(p); }
   float sfbm(vec2 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++) { s += a * sn(p); p = p * 2.03 + vec2(17.3, 9.1); a *= 0.5; } return s; }`;
 // 空：カメラを中心にした球の内側に描く（いちばん奥。地平線の色は霧の色と同じにして、遠くの景色とつながるように、明るさの変換はかけない）。
 //   ・頭の上ほど濃い青、地平線は白っぽいかすみ。太陽のまわりは明るく、朝夕は太陽の方角の低い空が赤い
 //   ・雲：頭の上の平らな面に、重ねたノイズで形を作る。太陽の側が明るく、厚い所の底は灰色。風でゆっくり流れる。天気で量が変わる
 //   ・夜：星（またたく）
 function makeSkyDome() {
+  SkyU.uNoiseT.value = NoiseTex.get();
   const mat = new THREE.ShaderMaterial({
     uniforms: SkyU, side: THREE.BackSide, depthWrite: false, fog: false, toneMapped: false,
     vertexShader: `varying vec3 vDir;
@@ -8689,6 +8820,7 @@ function makeSkyDome() {
 // 海：波（向きと長さのちがう 7 つの波と、細かいさざ波）で面を傾け、浅い角度では空を映し、太陽の方角には照り返しの道ができる。
 // 真上に近い角度では少し透けて、浅瀬の砂（地面）と深い所の色（下に敷いた面）が見える。遠くでは波が画素より細かくなるので、平均の見え方に寄せる
 function makeSeaMaterial() {
+  SkyU.uNoiseT.value = NoiseTex.get();
   return new THREE.ShaderMaterial({
     uniforms: Object.assign(THREE.UniformsUtils.merge([THREE.UniformsLib.fog]), SkyU, { uBody: { value: new THREE.Color(0x1B4F5E) }, uRough: { value: 1 } }),
     fog: true, transparent: true,
@@ -8907,6 +9039,8 @@ class World {
       this.toWorld(-0.9, 0.15, 3.3, a.position); a.rotation.y = this.yawAt(-0.9) + 0.4;   // 看板と前扉のあいだ（入口は中扉）
       env.add(a);
     }
+    // 停留所の看板・ベンチ・電柱など、動かない物は、位置の行列を 1 回だけ計算して固定する（海は見ている所について動くので除く。文字の札も除く）
+    env.traverse((o) => { if (o === env || o === sea || o.parent === sea || !(o.isMesh || o.isGroup)) return; o.updateMatrix(); o.matrixAutoUpdate = false; });
     if (this.rain) { this.scene.remove(this.rain.mesh); this.rain = null; }
   }
   utilityPoles(path, stopS) {
@@ -9009,7 +9143,7 @@ class World {
     Town.frame++;
     const ts = Town.tile, R = 950;
     const i0 = Math.floor((cx - R) / ts), i1 = Math.floor((cx + R) / ts), j0 = Math.floor((cz - R) / ts), j1 = Math.floor((cz + R) / ts);
-    let built = 0;
+    let built = 0, added = 0;
     const want = new Set();
     const cand = [];
     for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
@@ -9021,6 +9155,7 @@ class World {
       if (!this.tiles.has(key)) cand.push([d, key]);
     }
     cand.sort((a, b) => a[0] - b[0]);
+    this.townMissing = cand.length;
     // 先の分も読み込んでおく（早送りでも地面が抜けないように）
     if (Town.frame % 30 === 0) {
       const RP = 1700;
@@ -9030,12 +9165,14 @@ class World {
       if (!Town.ensure(key)) continue;
       const g = Town.geo.get(key);
       if (!g) {
-        if (built >= budget || this.pendingTiles.has(key)) continue;
+        if (built >= budget || this.pendingTiles.has(key) || this.pendingTiles.size >= (budget > 2 ? 6 : 3)) continue;
         built++; this.pendingTiles.add(key);
         Town.buildTile(key).then(() => this.pendingTiles.delete(key)).catch((e) => { console.warn("tile", key, e); this.pendingTiles.delete(key); });
         continue;
       }
-      this.addTile(key, g);
+      // 画面に足すのは、ふだんは 1 コマに 1 枚（模型や標識を組み立てるので、何枚も重なると引っかかる）。大きく動いたときは 6 枚まで
+      if (added >= (budget > 2 ? 6 : 1)) continue;
+      added++; this.addTile(key, g);
     }
     for (const [key, o] of this.tiles) if (!want.has(key)) { this.town.remove(o.grp); o.geo.refs--; this.tiles.delete(key); }
     // 木：遠いタイルでは本数を減らす
@@ -9090,14 +9227,20 @@ class World {
     // 主要施設の模型（写真を見て、形を組み立てたもの）
     for (const sp of g.special || []) { try { this.placeModel(grp, sp); } catch (e) { console.warn("model", sp.f.name, e); } }
     // 信号機・標識・停止線・横断歩道・黄色の中央線
-    const TR = Town.traffic && Town.traffic.t[key];
+    // 自分のタイルに交通のデータがなくても、となりのタイルから入ってくる線（黄色の中央線など）があれば描く
+    const TR = Town.traffic && (Town.traffic.t[key] || (Object.keys(Town.trafficOf(key)).length ? {} : null));
     const heads = TR ? this.placeTraffic(grp, TR, g) : null;
+    // タイルの中の物は動かない：位置の行列を 1 回だけ計算して固定する（毎コマ計算し直すと、物が多いので 1 コマに数ミリ秒かかる）。
+    // あとから読みこんで足す模型（駅など）は、足したあと、ふつうに計算される
+    grp.traverse((o) => { o.updateMatrix(); o.matrixAutoUpdate = false; });
     this.town.add(grp);
+    grp.updateMatrixWorld(true);
     this.tiles.set(key, { grp, geo: g, trees, heads });
     g.refs++;
   }
   placeTraffic(grp, T, G) {
     const X = Traffic.get();
+    const TL = G ? Town.trafficOf(G.key) : T, ts = Town.tile;
     const hy = (x, z) => Town.hAt(x, z) ?? 0;
     const sy = (x, z, lift) => (G && G.surfY ? G.surfY(x, z, lift) : hy(x, z) + lift);
     // 路面の印（横断歩道の縞・停止線＝白、はみ出し禁止＝黄）
@@ -9123,7 +9266,8 @@ class World {
     const dtri = (B, tri, lift) => {
       const cr = (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1]) - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0]);
       if (cr > 0) { const t = tri[1]; tri[1] = tri[2]; tri[2] = t; }
-      drapeGrid(tri, (Q) => { const k = B.p.length / 3; for (const q of Q) B.p.push(q[0], sy(q[0], q[1], lift), q[1]); for (let j = 1; j + 1 < Q.length; j++) B.i.push(k, k + j, k + j + 1); });
+      const tc = G ? clipRect(tri, G.ox, G.oz, G.ox + ts, G.oz + ts) : tri; if (!tc.length) return;
+      drapeGrid(tc, (Q) => { const k = B.p.length / 3; for (const q of Q) B.p.push(q[0], sy(q[0], q[1], lift), q[1]); for (let j = 1; j + 1 < Q.length; j++) B.i.push(k, k + j, k + j + 1); });
     };
     const strip = (B, pts, w, lift, smooth = true) => {
       let P = []; for (let i = 0; i + 1 < pts.length; i += 2) P.push([pts[i], pts[i + 1]]);
@@ -9136,10 +9280,10 @@ class World {
         dtri(B, [A, Bq, C], lift); dtri(B, [A, C, D], lift);
       }
     };
-    for (const [x1, z1, x2, z2, w] of T.sl || []) strip(W_, [x1, z1, x2, z2], w, 0.08, false);
-    for (const l of T.yl || []) strip(Y_, l, 0.15, 0.085);
+    for (const [x1, z1, x2, z2, w] of TL.sl || []) strip(W_, [x1, z1, x2, z2], w, 0.08, false);
+    for (const l of TL.yl || []) strip(Y_, l, 0.15, 0.085);
     // 上下線が分かれた道の白線（外側線・分離帯側の線・車線の境の破線）
-    for (const l of T.wl || []) strip(W_, l, 0.15, 0.08);
+    for (const l of TL.wl || []) strip(W_, l, 0.15, 0.08);
     // 中央分離帯：中心線と幅の列 [x, z, 幅, ...]。高さ 20cm の縁石（幅 15cm）と、真ん中の植え込み
     const MT = { p: [], i: [] }, MC = { p: [], i: [] };
     const wall = (a, b, h) => {
@@ -9201,7 +9345,7 @@ class World {
       if (type === 0) {
         // 「止まれ」：いちばん近い停止線（10m 以内）の手前 0.8m から、長さ 5.5m
         let best = null;
-        for (const [x1, z1, x2, z2] of T.sl || []) { const mx = (x1 + x2) / 2, mz = (z1 + z2) / 2, dd = Math.hypot(mx - x, mz - z); if (dd < 10 && (!best || dd < best[0])) best = [dd, mx, mz, Math.hypot(x2 - x1, z2 - z1)]; }
+        for (const [x1, z1, x2, z2] of TL.sl || []) { const mx = (x1 + x2) / 2, mz = (z1 + z2) / 2, dd = Math.hypot(mx - x, mz - z); if (dd < 10 && (!best || dd < best[0])) best = [dd, mx, mz, Math.hypot(x2 - x1, z2 - z1)]; }
         if (!best) continue;
         const w = Math.min(1.15, best[3] * 0.5), L = w * 5;
         decal(X.stopText, [best[1] - t[0] * (0.8 + L), best[2] - t[1] * (0.8 + L)], t, w, L);
@@ -9958,7 +10102,11 @@ class World {
     this.sea && this.sea.position.set(this.target.x, 0, this.target.z);
     // 早送りなどで大きく動いたときは、まとめて読み込む
     const far = this.lastTownAt ? Math.hypot(this.target.x - this.lastTownAt.x, this.target.z - this.lastTownAt.z) > 150 : true;
-    this.updateTown(this.target.x, this.target.z, far || this.townBurst ? 8 : 2);
+    // まだ出ていないタイルが多いあいだ（場所を大きく動いた直後・早送り）は、組み立てを急ぐ：1 コマに 30 ミリ秒まで・同時に 6 枚まで。
+    // ふだん（走りながら 1 列ずつ増えるとき）は 1 コマに 7 ミリ秒まで・同時に 3 枚まで
+    const rush = far || this.townBurst || (this.townMissing || 0) > 8;
+    Slots.budget = rush ? 30 : 7;
+    this.updateTown(this.target.x, this.target.z, rush ? 8 : 2);
     this.townBurst = false;
     if (far) this.lastTownAt = { x: this.target.x, z: this.target.z };
     else if (!this.lastTownAt) this.lastTownAt = { x: this.target.x, z: this.target.z };
@@ -11288,7 +11436,7 @@ function todayTokyo() {
 // 定期を使わない人のうち高齢の方の割合の初期値：令和6年度の利用者アンケートの年齢（65歳以上）と、令和6年6月の OD 調査の券種の割合から（5% 刻み）
 function eldDefault() { return S.RD && S.RD.survey ? Math.round(S.RD.survey.elderlyNonPass * 20) / 20 : 0.35; }
 // データの版（更新したとき、ブラウザに残った古いデータを使わないように URL に付ける）
-const DATA_V = "55";
+const DATA_V = "56";
 // シミュレーションできる日付は、乗降の実績がある期間（令和7年11月1日〜令和8年3月31日）だけ。
 // 期間外の日付は、同じ月日の期間内の日に寄せる（無ければ期間の最初の日）
 function clampDate(d) {
@@ -11327,6 +11475,8 @@ renderer.toneMappingExposure = 1.05;
 const cam = new FollowCam(stage);
 window.__urikkoR = renderer;
 window.__urikkoCam = cam;
+window.__townH = (x, z) => Town.hAt(x, z);      // 確認用：その場所の地面の高さ
+window.__town = Town; window.__inflate = inflateB64; window.__slots = Slots;   // 確認用：町のデータ（タイルを組み立てる時間を測るなど）
 const map = new RouteMap($("#map"));
 const pop = new PopView($("#popView"));
 window.__urikkoPop = pop;
@@ -12197,7 +12347,11 @@ function openAbout() {
         <h5>河和駅の乗り場</h5>
         <p class="note">バスは駅前の広場（ロータリー）に西の端から入り、駐輪場の屋根に沿って進み、<b>右回りは駅ビルの前</b>、<b>左回りは駐輪場の屋根の前</b>の乗り場に停まります。豊浜線は、河和駅を出る便は駅ビルの前、河和駅に着く便は駐輪場の屋根の前の乗り場としています（豊浜線の乗り場は、時刻表に書かれていないので仮定です）。</p>
         <h5>知多厚生病院前の乗り場</h5>
-        <p class="note">停留所は県道の路肩ではなく、<b>病院の正面の車寄せの前</b>にあります（ストリートビュー・写真で確かめました）。バスは県道から病院の敷地に入り（河和山から来る便は右折、河和駅から来る便は左折）、駐車場ぞいを東へ進んで、駐車場へ続く屋根つきの通路の手前で回り、<b>車寄せの縁石ぞいを西へ戻りながら、ひさしの西の端の乗り場に停まります</b>。県道に出る手前で一時停止します。どちらの向きの便も同じ乗り場です。敷地の中の通り方・停止線・乗り場の位置は、写真と基盤地図情報の屋根の形からの推定です（ひさしの奥行きも基盤地図情報に合わせました）。</p>` },
+        <p class="note">停留所は県道の路肩ではなく、<b>病院の正面の車寄せの前</b>にあります（ストリートビュー・写真で確かめました）。バスは県道から病院の敷地に入り（河和山から来る便は右折、河和駅から来る便は左折）、駐車場ぞいを東へ進んで、駐車場へ続く屋根つきの通路の手前で回り、<b>車寄せの縁石ぞいを西へ戻りながら、ひさしの西の端の乗り場に停まります</b>。県道に出る手前で一時停止します。どちらの向きの便も同じ乗り場です。敷地の中の通り方・停止線・乗り場の位置は、写真と基盤地図情報の屋根の形からの推定です（ひさしの奥行きも基盤地図情報に合わせました）。</p>
+        <h5>花ひろば・総合体育館前の乗り場</h5>
+        <p class="note">バスは行きどまりで U ターンせず、<b>ぐるっと回ります</b>。北西の道から来て、体育館の西の交差点をそのまま南へ進み、JA の集荷センターの南をまわって、南東の道を北東へ上り、<b>体育館の北東の道を北西へ走りながら乗り場に停まります</b>。体育館の北の角の交差点で左へ曲がり、体育館の北西の道を戻ります。どの便も同じ回り方です（走り方は地図で確かめたもの。乗り場は進む向きの左側としています）。</p>
+        <h5>豊浜港・魚ひろばの乗り場</h5>
+        <p class="note">左回り（高浜から来て新居へ向かう便）と豊浜線の同じ向きの便は、乗り場に停まったあと U ターンせず、<b>魚ひろばの建物と駐車場のまわりを一周</b>して北東へ戻り、来た道を逆にたどって国道247号の信号に出て、右へ曲がって新居へ向かいます（走り方は地図で確かめたもの）。右回りの便は、いままでどおり乗り場のあと北へ曲がります。</p>` },
       { title: `信号機・標識・停止線・横断歩道`, body: `<p class="note"><b>「交通規制情報」「信号制御情報」</b>（公益財団法人 日本道路交通情報センター（JARTIC）、愛知県警察の2026年8月のデータ）から、信号機（灯器の色は時刻で変わります）、最高速度と一時停止の標識、停止線、横断歩道、はみ出し禁止の黄色の中央線を描いています。</p>
         <h5>横断歩道</h5>
         <p class="note">道に平行な白い縞（<b>幅45cm・間45cm</b>、長さは横断歩道の幅）を車道の縁から縁まで等しい間隔で真ん中にそろえて並べ、道路の面と同じように地面に沿わせて描いています（JARTIC の線が横断歩道の両側の縁の2本になっている所は1つにまとめ、中央線・車線の線は横断歩道の所で切っています）。</p>
@@ -12673,6 +12827,7 @@ function frame(now) {
     $("#startBtn").hidden = false;
     showResults();
   }
+  Slots.t0 = performance.now();      // このコマを描き終えた時刻（タイルの組み立ては、ここから決まった時間だけ進める）
   requestAnimationFrame(frame);
 }
 
